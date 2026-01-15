@@ -6,13 +6,16 @@ Claude Desktop과 통신하여 SPARQL 쿼리를 실행합니다.
 """
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
+import re
 from typing import Any, Sequence
 from urllib.parse import urljoin
 
 import httpx
+from cachetools import TTLCache
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp.types import (
@@ -33,11 +36,30 @@ DEFAULT_DATASETS = ["fnco-sap-fi", "fnf-product", "fnf-hr"]
 DATASETS = os.environ.get("FUSEKI_DATASETS", ",".join(DEFAULT_DATASETS)).split(",")
 DEFAULT_DATASET = os.environ.get("FUSEKI_DEFAULT_DATASET", DATASETS[0])
 
+# 캐시 설정
+CACHE_TTL_NORMAL = 300  # 일반 쿼리: 5분
+CACHE_TTL_AGGREGATE = 1800  # 집계 쿼리: 30분
+CACHE_MAX_SIZE = 1000  # 최대 캐시 항목 수
+
+# 캐시 인스턴스 생성
+query_cache: TTLCache = TTLCache(maxsize=CACHE_MAX_SIZE, ttl=CACHE_TTL_NORMAL)
+aggregate_cache: TTLCache = TTLCache(maxsize=CACHE_MAX_SIZE, ttl=CACHE_TTL_AGGREGATE)
+
+# 집계 쿼리 패턴 (대소문자 무시)
+AGGREGATE_PATTERN = re.compile(r'\b(COUNT|SUM|AVG|MIN|MAX|GROUP\s+BY)\b', re.IGNORECASE)
+
 def get_query_endpoint(dataset: str) -> str:
     return f"{FUSEKI_BASE_URL}/{dataset}/query"
 
-def get_update_endpoint(dataset: str) -> str:
-    return f"{FUSEKI_BASE_URL}/{dataset}/update"
+def is_aggregate_query(query: str) -> bool:
+    """집계 쿼리 여부 판별 (COUNT, SUM, AVG, MIN, MAX, GROUP BY 포함 시)"""
+    return bool(AGGREGATE_PATTERN.search(query))
+
+def get_cache_key(query: str, dataset: str) -> str:
+    """쿼리와 데이터셋을 기반으로 캐시 키 생성"""
+    normalized_query = ' '.join(query.split())  # 공백 정규화
+    key_string = f"{dataset}:{normalized_query}"
+    return hashlib.sha256(key_string.encode()).hexdigest()
 
 # MCP 서버 생성
 app = Server("fuseki-mcp-server")
@@ -129,25 +151,6 @@ async def list_tools() -> list[Tool]:
                         "type": "string",
                         "enum": dataset_enum,
                         "description": f"Dataset to query (default: {DEFAULT_DATASET})"
-                    }
-                },
-                "required": ["query"]
-            }
-        ),
-        Tool(
-            name="sparql_update",
-            description="Execute a SPARQL UPDATE query on the Fuseki dataset",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "query": {
-                        "type": "string",
-                        "description": "SPARQL UPDATE query to execute"
-                    },
-                    "dataset": {
-                        "type": "string",
-                        "enum": dataset_enum,
-                        "description": f"Dataset to update (default: {DEFAULT_DATASET})"
                     }
                 },
                 "required": ["query"]
@@ -254,15 +257,6 @@ async def call_tool(name: str, arguments: Any) -> Sequence[TextContent]:
                 text=json.dumps(result, indent=2, ensure_ascii=False)
             )]
 
-        elif name == "sparql_update":
-            query = arguments.get("query")
-            dataset = arguments.get("dataset", DEFAULT_DATASET)
-            result = await execute_sparql_update(query, dataset)
-            return [TextContent(
-                type="text",
-                text=json.dumps(result, indent=2, ensure_ascii=False)
-            )]
-
         elif name == "get_dataset_info":
             dataset = arguments.get("dataset", DEFAULT_DATASET)
             info = await get_dataset_info(dataset)
@@ -319,7 +313,22 @@ async def call_tool(name: str, arguments: Any) -> Sequence[TextContent]:
 # Helper Functions
 
 async def execute_sparql_query(query: str, dataset: str = DEFAULT_DATASET) -> dict:
-    """SPARQL SELECT 쿼리 실행"""
+    """SPARQL SELECT 쿼리 실행 (캐시 적용)"""
+    cache_key = get_cache_key(query, dataset)
+    is_aggregate = is_aggregate_query(query)
+
+    # 적절한 캐시 선택
+    cache = aggregate_cache if is_aggregate else query_cache
+    cache_type = "aggregate" if is_aggregate else "normal"
+
+    # 캐시 히트 확인
+    if cache_key in cache:
+        logger.info(f"Cache HIT ({cache_type}): {cache_key[:16]}... [dataset={dataset}]")
+        return cache[cache_key]
+
+    logger.info(f"Cache MISS ({cache_type}): {cache_key[:16]}... [dataset={dataset}]")
+
+    # 캐시 미스: 실제 쿼리 실행
     async with httpx.AsyncClient(timeout=300.0) as client:
         response = await client.post(
             get_query_endpoint(dataset),
@@ -327,19 +336,13 @@ async def execute_sparql_query(query: str, dataset: str = DEFAULT_DATASET) -> di
             content=query
         )
         response.raise_for_status()
-        return response.json()
+        result = response.json()
 
+    # 결과 캐시에 저장
+    cache[cache_key] = result
+    logger.info(f"Cached ({cache_type}, TTL={CACHE_TTL_AGGREGATE if is_aggregate else CACHE_TTL_NORMAL}s): {cache_key[:16]}...")
 
-async def execute_sparql_update(query: str, dataset: str = DEFAULT_DATASET) -> dict:
-    """SPARQL UPDATE 쿼리 실행"""
-    async with httpx.AsyncClient(timeout=300.0) as client:
-        response = await client.post(
-            get_update_endpoint(dataset),
-            headers={"Content-Type": "application/sparql-update"},
-            content=query
-        )
-        response.raise_for_status()
-        return {"status": "success", "message": f"Update completed on {dataset}"}
+    return result
 
 
 async def get_dataset_info(dataset: str = DEFAULT_DATASET) -> dict:
